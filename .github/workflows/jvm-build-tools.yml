@@ -1,0 +1,136 @@
+name: jvm build tools
+
+# xim:kotlin and xim:coursier run their programs on the three hosts their JDK
+# serves. `ci-test.yml` installs a changed recipe and removes it; it never runs
+# the program. Here the compiler compiles a mixed Kotlin/Java program and runs
+# it, and the resolver fetches a Maven Central jar and a Google Maven AAR graph
+# with its JSON report -- the two things mcpp:plugins' dist-apk asks of them.
+# The runner images export a JAVA_HOME of their own, the condition under which
+# a launcher that trusts JAVA_HOME fails (measured in bundletool.yml).
+
+on:
+  pull_request:
+    paths:
+      - 'pkgs/k/kotlin.lua'
+      - 'pkgs/c/coursier.lua'
+      - '.github/workflows/jvm-build-tools.yml'
+      - '.github/scripts/program-checks/install-xlings.sh'
+      - '.github/scripts/program-checks/install-recipe.sh'
+      - '.github/scripts/program-checks/kotlin.sh'
+      - '.github/scripts/program-checks/coursier.sh'
+  workflow_dispatch:
+
+concurrency:
+  group: jvm-build-tools-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  posix:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install xlings
+        timeout-minutes: 15
+        run: bash .github/scripts/program-checks/install-xlings.sh
+
+      - name: Install kotlin from this checkout
+        timeout-minutes: 15
+        run: bash .github/scripts/program-checks/install-recipe.sh pkgs/k/kotlin.lua kotlinc KOTLINC
+
+      - name: kotlinc compiles a mixed Kotlin/Java program, and kotlin runs it
+        timeout-minutes: 10
+        run: bash .github/scripts/program-checks/kotlin.sh
+
+      - name: Install coursier from this checkout
+        timeout-minutes: 15
+        run: bash .github/scripts/program-checks/install-recipe.sh pkgs/c/coursier.lua cs CS
+
+      - name: cs fetches a Maven Central jar and a Google Maven AAR graph
+        timeout-minutes: 10
+        run: bash .github/scripts/program-checks/coursier.sh
+
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install xlings
+        timeout-minutes: 15
+        shell: pwsh
+        run: |
+          $env:XLINGS_NON_INTERACTIVE = "1"
+          $env:XLINGS_VERSION = "v2026.8.10.1"
+          iex (Invoke-WebRequest `
+            -Uri "https://raw.githubusercontent.com/openxlings/xlings/main/tools/other/quick_install.ps1" `
+            -UseBasicParsing).Content
+          $xlingsHome = "$env:USERPROFILE\.xlings"
+          if (-not (Test-Path "$xlingsHome\bin\xlings.exe")) {
+            throw "xlings install did not produce $xlingsHome\bin\xlings.exe"
+          }
+          Add-Content $env:GITHUB_PATH "$xlingsHome\bin"
+          Add-Content $env:GITHUB_PATH "$xlingsHome\subos\current\bin"
+          Add-Content $env:GITHUB_ENV  "XLINGS_HOME=$xlingsHome"
+
+      - name: Refresh the package index
+        timeout-minutes: 10
+        run: xlings update
+
+      - name: Install kotlin and coursier from this checkout
+        timeout-minutes: 25
+        shell: pwsh
+        run: |
+          xlings config --add-xpkg pkgs/k/kotlin.lua
+          xlings install local:kotlin -y
+          if ($LASTEXITCODE -ne 0) { throw "xlings install local:kotlin exited $LASTEXITCODE" }
+          xlings config --add-xpkg pkgs/c/coursier.lua
+          xlings install local:coursier -y
+          if ($LASTEXITCODE -ne 0) { throw "xlings install local:coursier exited $LASTEXITCODE" }
+
+      - name: kotlinc compiles and kotlin runs; cs fetches a jar and an AAR graph
+        timeout-minutes: 15
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          Write-Host "READING java-home-in-environment: $env:JAVA_HOME"
+          $kotlinHome = Join-Path $env:XLINGS_HOME "data\xpkgs\local-x-kotlin\2.4.20"
+          $kotlinc = Join-Path $kotlinHome "bin\kotlinc.bat"
+          $kotlin  = Join-Path $kotlinHome "bin\kotlin.bat"
+          foreach ($f in @($kotlinc, $kotlin, (Join-Path $kotlinHome "kotlinc\lib\kotlin-stdlib.jar"))) {
+            if (-not (Test-Path $f)) { Write-Host "::error::$f is absent"; exit 1 }
+          }
+          $out = (& $kotlinc -version 2>&1) -join " "
+          Write-Host "READING kotlinc -version: exit=$LASTEXITCODE $out"
+          if ($LASTEXITCODE -ne 0 -or $out -notmatch "2\.4\.20") { Write-Host "::error::kotlinc -version printed '$out'"; exit 1 }
+
+          $w = Join-Path $env:RUNNER_TEMP "kotlin"
+          New-Item -ItemType Directory -Force -Path $w | Out-Null
+          Set-Content -Path (Join-Path $w "Main.kt") -Value 'fun main(args: Array<String>) { println("KOTLIN-MARKER " + args.joinToString(",")) }'
+          & $kotlinc (Join-Path $w "Main.kt") -include-runtime -d (Join-Path $w "hello.jar")
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::kotlinc exited $LASTEXITCODE"; exit 1 }
+          $out = (& $kotlin -cp (Join-Path $w "hello.jar") MainKt a b 2>&1) -join " "
+          Write-Host "READING kotlin MainKt a b: exit=$LASTEXITCODE $out"
+          if ($LASTEXITCODE -ne 0 -or $out.Trim() -ne "KOTLIN-MARKER a,b") { Write-Host "::error::the program printed '$out'"; exit 1 }
+
+          $cs = Join-Path $env:XLINGS_HOME "data\xpkgs\local-x-coursier\2.1.24\bin\cs.bat"
+          if (-not (Test-Path $cs)) { Write-Host "::error::$cs is absent"; exit 1 }
+          $out = (& $cs version 2>&1) -join " "
+          Write-Host "READING cs version: exit=$LASTEXITCODE $out"
+          if ($LASTEXITCODE -ne 0 -or $out.Trim() -ne "2.1.24") { Write-Host "::error::cs version printed '$out'"; exit 1 }
+          $cache = Join-Path $env:RUNNER_TEMP "cs-cache"
+          $json = Join-Path $env:RUNNER_TEMP "graph.json"
+          & $cs fetch --cache $cache -r https://maven.google.com -r https://repo1.maven.org/maven2 -A aar,jar --json-output-file $json androidx.startup:startup-runtime:1.1.1
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::cs fetch exited $LASTEXITCODE"; exit 1 }
+          $deps = (Get-Content $json -Raw | ConvertFrom-Json).dependencies
+          $files = $deps | ForEach-Object { $_.file }
+          Write-Host "READING graph: $($deps.coord -join ', ')"
+          foreach ($want in @("startup-runtime-1.1.1.aar", "tracing-1.0.0.aar", "annotation-1.1.0.jar")) {
+            $hit = $files | Where-Object { $_ -like "*$want" -and (Test-Path $_) }
+            if (-not $hit) { Write-Host "::error::the graph has no $want on disk"; exit 1 }
+          }

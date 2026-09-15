@@ -6,8 +6,10 @@ name: apple runners
 # it; it never runs the program the recipe writes. These jobs install the
 # recipe from this checkout and run its program on bundles built in the job:
 # `macapp-run` (xim:macapp-run) on macOS application bundles, and `simctl-run`
-# (xim:apple-simulator-tools) on iOS simulator bundles. Each criterion prints a
-# READING line and the step fails on the first criterion that does not hold.
+# (xim:apple-simulator-tools) on iOS simulator bundles, and `devicectl-run`
+# (xim:apple-device-tools) through the refusals a runner with no iOS device
+# attached can reach. Each criterion prints a READING line and the step fails
+# on the first criterion that does not hold.
 
 on:
   pull_request:
@@ -19,6 +21,8 @@ on:
       - '.github/scripts/program-checks/install-recipe.sh'
       - '.github/scripts/program-checks/macapp-run.sh'
       - '.github/scripts/program-checks/simctl-run.sh'
+      - 'pkgs/a/apple-device-tools.lua'
+      - '.github/scripts/program-checks/devicectl-run.sh'
   workflow_dispatch:
 
 concurrency:
@@ -61,3 +65,21 @@ jobs:
       - name: simctl-run returns an installed bundle's status and output
         timeout-minutes: 60
         run: bash .github/scripts/program-checks/simctl-run.sh
+
+  devicectl-run:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install xlings
+        timeout-minutes: 15
+        run: bash .github/scripts/program-checks/install-xlings.sh
+
+      - name: Install apple-device-tools from this checkout
+        timeout-minutes: 10
+        run: bash .github/scripts/program-checks/install-recipe.sh pkgs/a/apple-device-tools.lua devicectl-run DEVICECTL_RUN
+
+      - name: devicectl-run refuses what a runner with no device attached can check
+        timeout-minutes: 10
+        run: bash .github/scripts/program-checks/devicectl-run.sh
